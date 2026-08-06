@@ -12,6 +12,7 @@
 //! resolved to numeric codes at load. The input path never allocates.
 
 mod capture;
+pub mod editor;
 mod gesture;
 mod keys;
 mod pad;
