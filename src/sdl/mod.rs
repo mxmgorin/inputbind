@@ -1,5 +1,11 @@
-//! The SDL2 backend — the only file in this module that names SDL. Everything
-//! above it works in [`Pad`]s, [`Mods`] and normalized key names.
+//! The SDL2 backend — the only module that names SDL. Everything above it
+//! works in [`Pad`]s, [`Mods`] and normalized key names.
+
+mod gamepad;
+mod keymap;
+
+pub use gamepad::Gamepad;
+pub use keymap::Keymap;
 
 use super::gesture::normalize;
 use super::pad::Pad;
