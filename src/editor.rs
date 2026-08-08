@@ -41,8 +41,6 @@ pub enum Row<A> {
     Suppressed { text: String, surface: &'static str },
     /// Activating starts listening for a gesture to bind to this action.
     Add(A),
-    /// Put one table back to its shipped state.
-    Reset(Source),
 }
 
 impl<A> Row<A> {
@@ -205,8 +203,8 @@ pub fn meets_every_requirement<A: Action>(table: &Table, required: &[Requirement
     })
 }
 
-/// A header, the gestures bound to it and an Add row per action, then one reset
-/// per editable table.
+/// A header, the gestures bound to it and an Add row per action. Restoring a
+/// table is the host's to offer: the editor only edits.
 ///
 /// Actions are listed by name: with many of them, finding the one you want
 /// beats keeping related ones together. Sorted per rebuild, not per frame.
@@ -224,8 +222,6 @@ fn build_rows<A: Action>(
             rows.extend(action_rows(store, surfaces, action));
         }
     }
-    rows.push(Row::Reset(Source::Gamepad));
-    rows.push(Row::Reset(Source::Keyboard));
     rows
 }
 
