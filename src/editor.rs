@@ -27,27 +27,41 @@ impl Source {
     }
 }
 
+/// A gesture as a collapsed [`Row::Command`] lists it.
+#[derive(Clone, Debug)]
+pub struct Bound {
+    pub text: String,
+    pub source: Source,
+    /// Bound in the base table but switched off on a surface — listed so the
+    /// line cannot show a binding while hiding that it does nothing there.
+    pub suppressed: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum Row<A> {
     /// A section's name. Not selectable.
     Group(&'static str),
-    /// An action's name. Not selectable — it labels the rows under it.
-    Header(&'static str),
-    /// A gesture bound to the action above; activating it unbinds.
+    /// An action and everything bound to it, on one line. Activating it opens
+    /// the rows below for editing, and closes them again.
+    Command {
+        action: A,
+        gestures: Vec<Bound>,
+        open: bool,
+    },
+    /// A gesture of the open command; activating it unbinds. Only ever listed
+    /// under an open one.
     Gesture { text: String, source: Source },
-    /// A gesture the base table binds to the action above, switched off by a
-    /// `none` override on one surface. Listed here or the screen would show the
-    /// binding and hide the fact that it does nothing there.
+    /// One of its gestures that a `none` override switched off on a surface.
     Suppressed { text: String, surface: &'static str },
     /// Activating starts listening for a gesture to bind to this action.
     Add(A),
 }
 
 impl<A> Row<A> {
-    /// Headers label the rows under them; only the rest can be focused, tapped
-    /// or activated.
+    /// A group labels the commands under it; only the rest can be focused,
+    /// tapped or activated.
     pub fn selectable(&self) -> bool {
-        !matches!(self, Row::Group(_) | Row::Header(_))
+        !matches!(self, Row::Group(_))
     }
 }
 
@@ -67,6 +81,9 @@ pub struct Controls<A: Action> {
     cursor: usize,
     /// The action being bound, while capture listens.
     capturing: Option<A>,
+    /// The one command showing its gestures. One at a time keeps the list the
+    /// length of the command set, which is the point of collapsing it.
+    open_command: Option<A>,
     groups: Groups<A>,
     surfaces: &'static [&'static str],
 }
@@ -79,12 +96,16 @@ impl<A: Action> Controls<A> {
             selectable: Vec::new(),
             cursor: 0,
             capturing: None,
+            open_command: None,
             groups,
             surfaces,
         }
     }
 
+    /// Opens collapsed: the list is the command set, and a screen kept open
+    /// from last time would be someone else's place, not yours.
     pub fn show(&mut self, store: &Store) {
+        self.open_command = None;
         self.rebuild(store);
         self.cursor = self.selectable.first().copied().unwrap_or(0);
         self.open = true;
@@ -93,6 +114,16 @@ impl<A: Action> Controls<A> {
     pub fn close(&mut self) {
         self.open = false;
         self.capturing = None;
+    }
+
+    /// Open a command's gestures, or close them if they are the open ones.
+    pub fn toggle_command(&mut self, action: A, store: &Store) {
+        self.open_command = if self.open_command == Some(action) {
+            None
+        } else {
+            Some(action)
+        };
+        self.rebuild(store);
     }
 
     pub fn rows(&self) -> &[Row<A>] {
@@ -144,7 +175,7 @@ impl<A: Action> Controls<A> {
     /// Rebuild from the store, keeping the cursor on a real row: an edit changes
     /// how many rows an action has.
     pub fn rebuild(&mut self, store: &Store) {
-        self.rows = build_rows(self.groups, self.surfaces, store);
+        self.rows = build_rows(self.groups, self.surfaces, store, self.open_command);
         self.selectable = self
             .rows
             .iter()
@@ -203,8 +234,9 @@ pub fn meets_every_requirement<A: Action>(table: &Table, required: &[Requirement
     })
 }
 
-/// A header, the gestures bound to it and an Add row per action. Restoring a
-/// table is the host's to offer: the editor only edits.
+/// A line per action, carrying what is bound to it, and the edit rows of the one
+/// that is open. Restoring a table is the host's to offer: the editor only
+/// edits.
 ///
 /// Actions are listed by name: with many of them, finding the one you want
 /// beats keeping related ones together. Sorted per rebuild, not per frame.
@@ -212,6 +244,7 @@ fn build_rows<A: Action>(
     groups: Groups<A>,
     surfaces: &'static [&'static str],
     store: &Store,
+    open: Option<A>,
 ) -> Vec<Row<A>> {
     let mut rows = Vec::new();
     for (group, members) in groups {
@@ -219,56 +252,78 @@ fn build_rows<A: Action>(
         let mut actions: Vec<&A> = members.iter().collect();
         actions.sort_by_key(|action| action.display());
         for action in actions {
-            rows.extend(action_rows(store, surfaces, action));
+            rows.extend(action_rows(store, surfaces, action, open == Some(*action)));
         }
     }
     rows
 }
 
-/// One action's header, the gestures bound to it, and its Add row.
+/// One action's line, and — while it is open — a row per gesture plus its Add.
 fn action_rows<A: Action>(
     store: &Store,
     surfaces: &'static [&'static str],
     action: &A,
+    open: bool,
 ) -> Vec<Row<A>> {
-    let mut rows = vec![Row::Header(action.display())];
-    {
-        let name = action.name();
-        for (text, _) in store.gamepad.iter().filter(|(_, bound)| *bound == name) {
-            rows.push(Row::Gesture {
+    let gestures = bound_gestures(store, surfaces, action);
+    let mut rows = vec![Row::Command {
+        action: *action,
+        gestures: gestures.clone(),
+        open,
+    }];
+    if !open {
+        return rows;
+    }
+    rows.extend(gestures.into_iter().map(|bound| match bound {
+        Bound {
+            text,
+            source: Source::Surface(surface),
+            suppressed: true,
+        } => Row::Suppressed { text, surface },
+        Bound { text, source, .. } => Row::Gesture { text, source },
+    }));
+    rows.push(Row::Add(*action));
+    rows
+}
+
+/// Everything bound to an action, base tables first and surface overrides after.
+fn bound_gestures<A: Action>(
+    store: &Store,
+    surfaces: &'static [&'static str],
+    action: &A,
+) -> Vec<Bound> {
+    let name = action.name();
+    let mut bound = Vec::new();
+    for (table, source) in [
+        (&store.gamepad, Source::Gamepad),
+        (&store.keyboard, Source::Keyboard),
+    ] {
+        for (text, _) in table.iter().filter(|(_, bound)| *bound == name) {
+            bound.push(Bound {
                 text: text.clone(),
-                source: Source::Gamepad,
+                source,
+                suppressed: false,
             });
         }
-        for (text, _) in store.keyboard.iter().filter(|(_, bound)| *bound == name) {
-            rows.push(Row::Gesture {
-                text: text.clone(),
-                source: Source::Keyboard,
-            });
-        }
-        for surface in surfaces {
-            let Some(table) = store.surface.get(*surface) else {
-                continue;
-            };
-            for (text, bound) in table {
-                if bound == name {
-                    rows.push(Row::Gesture {
-                        text: text.clone(),
-                        source: Source::Surface(surface),
-                    });
-                } else if bound == UNBOUND && store.gamepad.get(text).is_some_and(|b| b == name) {
-                    // Switched off here, but still this action's gesture
-                    // everywhere else.
-                    rows.push(Row::Suppressed {
-                        text: text.clone(),
-                        surface,
-                    });
-                }
+    }
+    for surface in surfaces {
+        let Some(table) = store.surface.get(*surface) else {
+            continue;
+        };
+        for (text, on) in table {
+            // Switched off here, but still this action's gesture everywhere
+            // else.
+            let suppressed = on == UNBOUND && store.gamepad.get(text).is_some_and(|b| b == name);
+            if on == name || suppressed {
+                bound.push(Bound {
+                    text: text.clone(),
+                    source: Source::Surface(surface),
+                    suppressed,
+                });
             }
         }
-        rows.push(Row::Add(*action));
     }
-    rows
+    bound
 }
 
 #[cfg(test)]
@@ -299,34 +354,92 @@ mod tests {
         store
     }
 
-    fn gestures_under(controls: &Controls<TestAction>, display: &str) -> Vec<(String, Source)> {
-        let rows = controls.rows();
-        let start = rows
+    /// What the line for `name` carries, suppressed entries aside.
+    fn gestures_under(controls: &Controls<TestAction>, name: &str) -> Vec<(String, Source)> {
+        bound_under(controls, name)
             .iter()
-            .position(|r| matches!(r, Row::Header(h) if *h == display))
-            .expect("action is listed");
-        rows[start + 1..]
-            .iter()
-            .take_while(|r| !matches!(r, Row::Header(_)))
-            .filter_map(|r| match r {
-                Row::Gesture { text, source } => Some((text.clone(), *source)),
-                _ => None,
-            })
+            .filter(|b| !b.suppressed)
+            .map(|b| (b.text.clone(), b.source))
             .collect()
     }
 
-    #[test]
-    fn every_action_gets_a_header_and_an_add_row() {
-        let mut c = controls();
-        c.show(&store());
-        let headers = c
+    fn bound_under<'a>(controls: &'a Controls<TestAction>, name: &str) -> &'a [Bound] {
+        controls
             .rows()
             .iter()
-            .filter(|r| matches!(r, Row::Header(_)))
+            .find_map(|r| match r {
+                Row::Command {
+                    action, gestures, ..
+                } if action.name() == name => Some(gestures.as_slice()),
+                _ => None,
+            })
+            .expect("action is listed")
+    }
+
+    #[test]
+    fn every_action_gets_one_line_and_nothing_more_until_it_opens() {
+        let mut c = controls();
+        c.show(&store());
+        let commands = c
+            .rows()
+            .iter()
+            .filter(|r| matches!(r, Row::Command { .. }))
             .count();
-        let adds = c.rows().iter().filter(|r| matches!(r, Row::Add(_))).count();
-        assert_eq!(headers, TestAction::all().len());
-        assert_eq!(adds, TestAction::all().len());
+        assert_eq!(commands, TestAction::all().len());
+        assert_eq!(c.rows().len(), commands + GROUPS.len());
+
+        c.toggle_command(TestAction::Confirm, &store());
+        // Its own gestures and its Add row, and no other action's.
+        assert_eq!(
+            c.rows().len(),
+            commands + GROUPS.len() + bound_under(&c, "confirm").len() + 1
+        );
+        assert_eq!(
+            c.rows().iter().filter(|r| matches!(r, Row::Add(_))).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn opening_a_second_command_closes_the_first() {
+        let mut c = controls();
+        let s = store();
+        c.show(&s);
+        c.toggle_command(TestAction::Confirm, &s);
+        c.toggle_command(TestAction::PageNext, &s);
+        let open: Vec<&str> = c
+            .rows()
+            .iter()
+            .filter_map(|r| match r {
+                Row::Command { action, open, .. } if *open => Some(action.name()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(open, ["page_next"]);
+    }
+
+    #[test]
+    fn toggling_the_open_command_closes_it() {
+        let mut c = controls();
+        let s = store();
+        c.show(&s);
+        let collapsed = c.rows().len();
+        c.toggle_command(TestAction::Confirm, &s);
+        assert!(c.rows().len() > collapsed);
+        c.toggle_command(TestAction::Confirm, &s);
+        assert_eq!(c.rows().len(), collapsed);
+    }
+
+    #[test]
+    fn reopening_the_screen_collapses_it_again() {
+        let mut c = controls();
+        let s = store();
+        c.show(&s);
+        let collapsed = c.rows().len();
+        c.toggle_command(TestAction::Confirm, &s);
+        c.close();
+        c.show(&s);
+        assert_eq!(c.rows().len(), collapsed);
     }
 
     #[test]
@@ -341,10 +454,10 @@ mod tests {
                     groups.push(name);
                     per_group.push(Vec::new());
                 }
-                Row::Header(name) => per_group
+                Row::Command { action, .. } => per_group
                     .last_mut()
                     .expect("a group opens before any action")
-                    .push(name),
+                    .push(action.display()),
                 _ => {}
             }
         }
@@ -377,16 +490,24 @@ mod tests {
 
     #[test]
     fn an_override_is_shown_so_the_screen_does_not_hide_it() {
-        // `[surface.reader] a = "none"` switches A off there; without the row
-        // the screen would still show A under confirm and read as a lie.
+        // `[surface.reader] a = "none"` switches A off there; unmarked, the
+        // screen would still show A under confirm and read as a lie.
         let mut c = controls();
-        c.show(&store());
+        let s = store();
+        c.show(&s);
+        assert!(
+            bound_under(&c, "confirm")
+                .iter()
+                .any(|b| b.text == "a" && b.suppressed),
+            "the collapsed line should carry the reader override"
+        );
+        c.toggle_command(TestAction::Confirm, &s);
         assert!(
             c.rows()
                 .iter()
                 .any(|r| matches!(r, Row::Suppressed { text, surface }
                 if text == "a" && *surface == "reader")),
-            "the reader override should have a row"
+            "opening it should give the override a row"
         );
         // The base binding is still listed too: A confirms, just not there.
         assert_eq!(
@@ -396,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_skips_headers_and_clamps() {
+    fn the_cursor_skips_groups_and_clamps() {
         let mut c = controls();
         c.show(&store());
         assert!(c.selected().is_some_and(|r| r.selectable()));
@@ -410,16 +531,16 @@ mod tests {
     }
 
     #[test]
-    fn a_tap_on_a_header_is_ignored() {
+    fn a_tap_on_a_group_is_ignored() {
         let mut c = controls();
         c.show(&store());
-        let header = c
+        let group = c
             .rows()
             .iter()
-            .position(|r| matches!(r, Row::Header(_)))
-            .expect("a header exists");
+            .position(|r| matches!(r, Row::Group(_)))
+            .expect("a group exists");
         let before = c.cursor();
-        c.set_cursor(header);
+        c.set_cursor(group);
         assert_eq!(c.cursor(), before);
     }
 
@@ -428,6 +549,7 @@ mod tests {
         let mut c = controls();
         let mut s = store();
         c.show(&s);
+        c.toggle_command(TestAction::Confirm, &s);
         // Sit on the gamepad gesture under confirm, then unbind it.
         let row = c
             .rows()
