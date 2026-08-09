@@ -2,6 +2,7 @@
 //! the last one pressed winning. Time comes in through `now`, as everywhere else
 //! here, so a loop pass is one instant and tests drive it directly.
 
+use super::pad::Edge;
 use std::time::{Duration, Instant};
 
 /// How a held input repeats.
@@ -50,18 +51,23 @@ impl<K: Copy + PartialEq, A: Copy> Repeater<K, A> {
         }
     }
 
+    pub(super) fn set_cadence(&mut self, cadence: Cadence) {
+        self.cadence = cadence;
+    }
+
     pub(super) fn clear(&mut self) {
         self.held = None;
     }
 
-    pub(super) fn tick(&mut self, now: Instant, out: &mut Vec<A>) {
+    /// Each repeat is a fresh press; a repeating action is never a held one.
+    pub(super) fn tick(&mut self, now: Instant, out: &mut Vec<(A, Edge)>) {
         let Some(held) = &mut self.held else { return };
         let due = match held.last {
             None => now.duration_since(held.pressed_at) >= self.cadence.initial_delay,
             Some(last) => now.duration_since(last) >= self.cadence.interval,
         };
         if due {
-            out.push(held.action);
+            out.push((held.action, Edge::Press));
             held.last = Some(now);
         }
     }

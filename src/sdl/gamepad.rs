@@ -2,7 +2,7 @@
 //! [`PadState`]; this only translates and folds the analog axes into presses.
 
 use super::axis_value;
-use crate::{Action, Bindings, Cadence, Pad, PadState, Stick, SurfaceId, Trigger};
+use crate::{Action, Bindings, Cadence, Edge, Pad, PadState, Stick, SurfaceId, Trigger};
 use sdl2::controller::Axis;
 use std::time::{Duration, Instant};
 
@@ -24,9 +24,9 @@ impl<A: Action> Gamepad<A> {
     }
 
     /// Drop pads down and any repeat, so a reloaded table never resolves a press
-    /// that began under the old one.
-    pub fn reset(&mut self) {
-        self.state.reset();
+    /// that began under the old one. Owed release edges are emitted, not lost.
+    pub fn reset(&mut self, out: &mut Vec<(A, Edge)>) {
+        self.state.reset(out);
     }
 
     pub fn press(
@@ -36,7 +36,7 @@ impl<A: Action> Gamepad<A> {
         now: Instant,
         bindings: &Bindings<A>,
         surface: Option<SurfaceId>,
-        out: &mut Vec<A>,
+        out: &mut Vec<(A, Edge)>,
     ) {
         if pressed {
             self.state.on_press(pad, now, bindings, surface, out);
@@ -52,7 +52,7 @@ impl<A: Action> Gamepad<A> {
         now: Instant,
         bindings: &Bindings<A>,
         surface: Option<SurfaceId>,
-        out: &mut Vec<A>,
+        out: &mut Vec<(A, Edge)>,
     ) {
         let edges = match axis {
             Axis::LeftX => self.stick.axis(true, axis_value(value)),
@@ -70,7 +70,7 @@ impl<A: Action> Gamepad<A> {
         }
     }
 
-    pub fn tick(&mut self, now: Instant, out: &mut Vec<A>) {
+    pub fn tick(&mut self, now: Instant, out: &mut Vec<(A, Edge)>) {
         self.state.tick(now, out);
     }
 
@@ -100,7 +100,7 @@ impl<A: Action> Gamepad<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{at, build, TestAction};
+    use crate::testkit::{actions, at, build, TestAction};
 
     const HOLD: Duration = Duration::from_millis(400);
     const CADENCE: Cadence = Cadence {
@@ -119,7 +119,7 @@ mod tests {
         let mut out = Vec::new();
         let t0 = Instant::now();
         g.on_axis(Axis::LeftY, i16::MAX, t0, &b, None, &mut out);
-        assert_eq!(out, [TestAction::NavDown]);
+        assert_eq!(actions(&out), [TestAction::NavDown]);
         // Back to center: the release stops the repeat, emitting nothing.
         out.clear();
         g.on_axis(Axis::LeftY, 0, at(t0, 50), &b, None, &mut out);

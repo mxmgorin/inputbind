@@ -24,7 +24,7 @@ mod store;
 pub use capture::{Capture, Captured, Tick};
 pub use gesture::{KeyGesture, PadGesture};
 pub use keys::KeyState;
-pub use pad::{Pad, PadState, Stick, Trigger};
+pub use pad::{Edge, Pad, PadState, Stick, Trigger};
 pub use repeat::Cadence;
 pub use store::{Store, Table, UNBOUND};
 
@@ -50,6 +50,12 @@ pub trait Action: Copy + Eq + 'static {
         false
     }
 
+    /// Spans press and release, as a click does. Resolved by a release, where no
+    /// edge is left to wait for, both go at once.
+    fn is_held(&self) -> bool {
+        false
+    }
+
     /// Must fire on the press edge, so `hold:` and chord gestures are refused
     /// on any pad whose tap carries it: deferring the tap to release would cost
     /// exactly the timing such an action depends on.
@@ -67,6 +73,11 @@ impl Mods {
     pub const CTRL: Mods = Mods(1);
     pub const ALT: Mods = Mods(2);
     pub const SHIFT: Mods = Mods(4);
+
+    /// Neither Ctrl nor Alt, so it collides with typing; Shift alone is still plain.
+    pub fn is_plain(self) -> bool {
+        !self.contains(Mods::CTRL) && !self.contains(Mods::ALT)
+    }
 
     pub fn contains(self, other: Mods) -> bool {
         self.0 & other.0 == other.0
@@ -363,6 +374,8 @@ mod testkit {
         PageNext,
         ThemeNext,
         NavDown,
+        /// Spans both edges, as a host's click does.
+        Click,
     }
 
     impl Action for TestAction {
@@ -372,6 +385,7 @@ mod testkit {
                 TestAction::PageNext => "page_next",
                 TestAction::ThemeNext => "theme_next",
                 TestAction::NavDown => "nav_down",
+                TestAction::Click => "click",
             }
         }
 
@@ -385,12 +399,17 @@ mod testkit {
                 TestAction::PageNext,
                 TestAction::ThemeNext,
                 TestAction::NavDown,
+                TestAction::Click,
             ]
         }
 
         // As in the host app: what repeats is exactly what needs the press edge.
         fn repeats(&self) -> bool {
             matches!(self, TestAction::NavDown | TestAction::PageNext)
+        }
+
+        fn is_held(&self) -> bool {
+            matches!(self, TestAction::Click)
         }
 
         fn needs_press_edge(&self) -> bool {
@@ -409,6 +428,11 @@ mod testkit {
     /// `t0` shifted `ms` forward, so tests spell instants as offsets.
     pub(super) fn at(t0: Instant, ms: u64) -> Instant {
         t0 + Duration::from_millis(ms)
+    }
+
+    /// Just the actions, for assertions that do not care about edges.
+    pub(super) fn actions<A: Copy>(out: &[(A, Edge)]) -> Vec<A> {
+        out.iter().map(|(action, _)| *action).collect()
     }
 }
 

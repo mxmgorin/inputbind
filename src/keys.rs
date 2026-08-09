@@ -3,38 +3,54 @@
 //! press emits at once and a release only stops the repeat.
 
 use super::repeat::{Cadence, Repeater};
-use super::Action;
+use super::{Action, Edge};
 use std::time::{Duration, Instant};
 
 pub struct KeyState<A: Action> {
     repeat: Repeater<u32, A>,
+    /// A held action whose press edge fired here; this key owes its close.
+    owed: Option<(u32, A)>,
 }
 
 impl<A: Action> KeyState<A> {
     pub fn new(cadence: Cadence) -> Self {
         Self {
             repeat: Repeater::new(cadence),
+            owed: None,
         }
     }
 
     /// Forget the held key, so a reloaded table cannot keep repeating an action
-    /// the key no longer carries.
-    pub fn reset(&mut self) {
+    /// the key no longer carries. Owed releases are emitted, not dropped.
+    pub fn reset(&mut self, out: &mut Vec<(A, Edge)>) {
+        if let Some((_, action)) = self.owed.take() {
+            out.push((action, Edge::Release));
+        }
         self.repeat.clear();
     }
 
-    pub fn on_press(&mut self, code: u32, action: A, now: Instant, out: &mut Vec<A>) {
-        out.push(action);
+    pub fn on_press(&mut self, code: u32, action: A, now: Instant, out: &mut Vec<(A, Edge)>) {
+        out.push((action, Edge::Press));
         if action.repeats() {
             self.repeat.start(code, action, now);
         }
+        if action.is_held() {
+            // A second key taking over closes the first.
+            if let Some((_, previous)) = self.owed.replace((code, action)) {
+                out.push((previous, Edge::Release));
+            }
+        }
     }
 
-    pub fn on_release(&mut self, code: u32) {
+    pub fn on_release(&mut self, code: u32, out: &mut Vec<(A, Edge)>) {
         self.repeat.stop(code);
+        if self.owed.is_some_and(|(held, _)| held == code) {
+            let (_, action) = self.owed.take().expect("just checked");
+            out.push((action, Edge::Release));
+        }
     }
 
-    pub fn tick(&mut self, now: Instant, out: &mut Vec<A>) {
+    pub fn tick(&mut self, now: Instant, out: &mut Vec<(A, Edge)>) {
         self.repeat.tick(now, out);
     }
 
@@ -45,7 +61,7 @@ impl<A: Action> KeyState<A> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::testkit::{at, TestAction};
+    use super::super::testkit::{actions, at, TestAction};
     use super::*;
 
     fn state() -> KeyState<TestAction> {
@@ -63,17 +79,17 @@ mod tests {
         let mut out = Vec::new();
         let t0 = Instant::now();
         s.on_press(CODE, TestAction::NavDown, t0, &mut out);
-        assert_eq!(out, [TestAction::NavDown]);
+        assert_eq!(actions(&out), [TestAction::NavDown]);
         out.clear();
         s.tick(at(t0, 299), &mut out);
         assert!(out.is_empty());
         s.tick(at(t0, 300), &mut out);
-        assert_eq!(out, [TestAction::NavDown]);
+        assert_eq!(actions(&out), [TestAction::NavDown]);
         out.clear();
         s.tick(at(t0, 400), &mut out);
-        assert_eq!(out, [TestAction::NavDown]);
+        assert_eq!(actions(&out), [TestAction::NavDown]);
         out.clear();
-        s.on_release(CODE);
+        s.on_release(CODE, &mut out);
         s.tick(at(t0, 600), &mut out);
         assert!(out.is_empty());
     }
@@ -84,7 +100,7 @@ mod tests {
         let mut out = Vec::new();
         let t0 = Instant::now();
         s.on_press(CODE, TestAction::Confirm, t0, &mut out);
-        assert_eq!(out, [TestAction::Confirm]);
+        assert_eq!(actions(&out), [TestAction::Confirm]);
         out.clear();
         assert_eq!(s.next_deadline(t0), None);
         s.tick(at(t0, 1000), &mut out);
@@ -100,11 +116,11 @@ mod tests {
         s.on_press(CODE + 1, TestAction::PageNext, at(t0, 50), &mut out);
         out.clear();
         s.tick(at(t0, 350), &mut out);
-        assert_eq!(out, [TestAction::PageNext]);
+        assert_eq!(actions(&out), [TestAction::PageNext]);
         // Releasing the older key leaves the newer one repeating.
         out.clear();
-        s.on_release(CODE);
+        s.on_release(CODE, &mut out);
         s.tick(at(t0, 460), &mut out);
-        assert_eq!(out, [TestAction::PageNext]);
+        assert_eq!(actions(&out), [TestAction::PageNext]);
     }
 }

@@ -6,7 +6,7 @@
 //! Rows are built from the store when the screen opens and after each edit, not
 //! per frame: the list is long and a renderer runs on every pass.
 
-use crate::{Action, Store, Table, UNBOUND};
+use crate::{Action, Pad, PadGesture, Store, Table, UNBOUND};
 
 /// Which table a gesture lives in.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -86,10 +86,14 @@ pub struct Controls<A: Action> {
     open_command: Option<A>,
     groups: Groups<A>,
     surfaces: &'static [&'static str],
+    /// Rows the host draws after these, which the cursor also spans.
+    trailing: usize,
 }
 
 impl<A: Action> Controls<A> {
-    pub fn new(groups: Groups<A>, surfaces: &'static [&'static str]) -> Self {
+    /// `trailing` selectable rows follow these, indexed from `rows().len()`, so
+    /// the host needs no second cursor of its own.
+    pub fn new(groups: Groups<A>, surfaces: &'static [&'static str], trailing: usize) -> Self {
         Self {
             open: false,
             rows: Vec::new(),
@@ -99,6 +103,7 @@ impl<A: Action> Controls<A> {
             open_command: None,
             groups,
             surfaces,
+            trailing,
         }
     }
 
@@ -107,8 +112,17 @@ impl<A: Action> Controls<A> {
     pub fn show(&mut self, store: &Store) {
         self.open_command = None;
         self.rebuild(store);
-        self.cursor = self.selectable.first().copied().unwrap_or(0);
+        self.focus_first();
         self.open = true;
+    }
+
+    pub fn focus_first(&mut self) {
+        self.cursor = self.selectable.first().copied().unwrap_or(0);
+    }
+
+    /// Which trailing row the cursor is on; [`Self::selected`] is `None` for these.
+    pub fn trailing_cursor(&self) -> Option<usize> {
+        self.cursor.checked_sub(self.rows.len())
     }
 
     pub fn close(&mut self) {
@@ -175,6 +189,9 @@ impl<A: Action> Controls<A> {
     /// Rebuild from the store, keeping the cursor on a real row: an edit changes
     /// how many rows an action has.
     pub fn rebuild(&mut self, store: &Store) {
+        // A cursor on one of the host's rows keeps that row rather than its
+        // index: opening a command changes how many rows precede it.
+        let trailing = self.trailing_cursor().filter(|k| *k < self.trailing);
         self.rows = build_rows(self.groups, self.surfaces, store, self.open_command);
         self.selectable = self
             .rows
@@ -182,7 +199,12 @@ impl<A: Action> Controls<A> {
             .enumerate()
             .filter(|(_, row)| row.selectable())
             .map(|(i, _)| i)
+            .chain(self.rows.len()..self.rows.len() + self.trailing)
             .collect();
+        if let Some(k) = trailing {
+            self.cursor = self.rows.len() + k;
+            return;
+        }
         if self.selectable.contains(&self.cursor) {
             return;
         }
@@ -197,6 +219,50 @@ impl<A: Action> Controls<A> {
             .copied()
             .unwrap_or(0);
     }
+}
+
+/// Why an edit cannot be made; the host words it.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Refusal {
+    /// Its tap must fire on the press edge, which this gesture would defer.
+    PressEdge(Pad),
+    /// The requirement's label; the table would stop meeting it.
+    Requirement(&'static str),
+}
+
+/// Whether `table` can take `gesture`, bound to `becomes` or unbound with `None`.
+/// Ask before editing, or the tables drop the gesture at load and say nothing.
+/// A `[keyboard]` table has no press edge, so it gets the requirement check only.
+pub fn validate<A: Action>(
+    table: &Table,
+    gesture: &str,
+    becomes: Option<A>,
+    required: &[Requirement<A>],
+) -> Result<(), Refusal> {
+    if becomes.is_some() {
+        if let Some(pad) = press_edge_conflict::<A>(table, gesture) {
+            return Err(Refusal::PressEdge(pad));
+        }
+    }
+    match requirement_lost(table, gesture, becomes, required) {
+        Some(label) => Err(Refusal::Requirement(label)),
+        None => Ok(()),
+    }
+}
+
+/// The [`Table`] counterpart of
+/// [`Bindings::press_edge_conflict`](crate::Bindings::press_edge_conflict); a test
+/// holds the two to the same answer.
+fn press_edge_conflict<A: Action>(table: &Table, gesture: &str) -> Option<Pad> {
+    // Only the leader waits; a tap replaces a tap, and the pad completing a
+    // chord keeps its own press edge.
+    let leader = match PadGesture::parse(gesture)? {
+        PadGesture::Tap(_) => return None,
+        PadGesture::Hold(pad) => pad,
+        PadGesture::Chord(leader, _) => leader,
+    };
+    let bound = table.get(leader.name()).and_then(|name| A::parse(name))?;
+    bound.needs_press_edge().then_some(leader)
 }
 
 /// The requirement `table` would no longer meet once `text` stops naming what it
@@ -333,12 +399,20 @@ mod tests {
 
     const GROUPS: Groups<TestAction> = &[
         ("General", &[TestAction::Confirm, TestAction::NavDown]),
-        ("Reading", &[TestAction::PageNext, TestAction::ThemeNext]),
+        (
+            "Reading",
+            &[
+                TestAction::PageNext,
+                TestAction::ThemeNext,
+                TestAction::Click,
+            ],
+        ),
     ];
     const SURFACES: &[&str] = &["reader"];
 
     fn controls() -> Controls<TestAction> {
-        Controls::new(GROUPS, SURFACES)
+        // No trailing rows: these tests are about the editor's own.
+        Controls::new(GROUPS, SURFACES, 0)
     }
 
     fn store() -> Store {
@@ -634,5 +708,195 @@ mod tests {
         let mut t = minimal();
         t.remove("down");
         assert!(!meets_every_requirement(&t, REQUIRED));
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+    use crate::testkit::TestAction;
+    use crate::{Bindings, PadGesture, Store};
+
+    const REQUIRED: &[Requirement<TestAction>] = &[("Confirm", &[TestAction::Confirm])];
+
+    fn table(pairs: &[(&str, TestAction)]) -> Table {
+        pairs
+            .iter()
+            .map(|(g, a)| (g.to_string(), a.name().to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_gesture_deferring_a_press_edge_tap_is_refused_with_the_pad() {
+        // R1 pages, so a hold or a chord it leads would move the page turn.
+        let t = table(&[("r1", TestAction::PageNext), ("a", TestAction::Confirm)]);
+        assert_eq!(
+            validate(&t, "hold:r1", Some(TestAction::ThemeNext), REQUIRED),
+            Err(Refusal::PressEdge(Pad::R1))
+        );
+        assert_eq!(
+            validate(&t, "r1+start", Some(TestAction::ThemeNext), REQUIRED),
+            Err(Refusal::PressEdge(Pad::R1))
+        );
+        assert_eq!(
+            validate(&t, "start+r1", Some(TestAction::ThemeNext), REQUIRED),
+            Ok(())
+        );
+        assert_eq!(
+            validate(&t, "hold:y", Some(TestAction::ThemeNext), REQUIRED),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn losing_a_requirements_last_gesture_is_refused_with_its_label() {
+        let t = table(&[("a", TestAction::Confirm), ("x", TestAction::PageNext)]);
+        assert_eq!(
+            validate(&t, "a", None, REQUIRED),
+            Err(Refusal::Requirement("Confirm"))
+        );
+        assert_eq!(
+            validate(&t, "a", Some(TestAction::PageNext), REQUIRED),
+            Err(Refusal::Requirement("Confirm"))
+        );
+        assert_eq!(validate(&t, "x", None, REQUIRED), Ok(()));
+        let mut spare = t.clone();
+        spare.insert("b".into(), TestAction::Confirm.name().into());
+        assert_eq!(validate(&spare, "a", None, REQUIRED), Ok(()));
+    }
+
+    #[test]
+    fn unbinding_skips_the_press_edge_rule() {
+        let t = table(&[
+            ("r1", TestAction::PageNext),
+            ("hold:r1", TestAction::ThemeNext),
+            ("a", TestAction::Confirm),
+        ]);
+        assert_eq!(validate(&t, "hold:r1", None, REQUIRED), Ok(()));
+    }
+
+    /// The two press-edge implementations read different shapes of the same
+    /// table, so they are held to the same answer rather than trusted to agree.
+    #[test]
+    fn the_table_and_the_built_tables_refuse_the_same_gestures() {
+        let store = Store {
+            gamepad: table(&[
+                ("r1", TestAction::PageNext),
+                ("down", TestAction::NavDown),
+                ("a", TestAction::Confirm),
+                ("y", TestAction::ThemeNext),
+            ]),
+            ..Store::default()
+        };
+        let built: Bindings<TestAction> = Bindings::new(&store, &[], |_| None);
+        for text in [
+            "hold:r1",
+            "hold:down",
+            "hold:a",
+            "hold:y",
+            "r1+start",
+            "start+r1",
+            "down+a",
+            "a",
+            "start",
+        ] {
+            let gesture = PadGesture::parse(text).expect("valid gesture");
+            assert_eq!(
+                press_edge_conflict::<TestAction>(&store.gamepad, text),
+                built.press_edge_conflict(gesture),
+                "disagreement on `{text}`"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod trailing_tests {
+    use super::*;
+    use crate::testkit::TestAction;
+
+    const GROUPS: Groups<TestAction> = &[("General", &[TestAction::Confirm, TestAction::NavDown])];
+    /// As a host's "restore the gamepad / keyboard defaults" pair.
+    const TRAILING: usize = 2;
+
+    fn controls() -> Controls<TestAction> {
+        let mut c = Controls::new(GROUPS, &[], TRAILING);
+        c.show(&Store::default());
+        c
+    }
+
+    #[test]
+    fn the_cursor_reaches_the_hosts_rows_past_the_editors_own() {
+        let mut c = controls();
+        let last_own = c.rows().len() - 1;
+        for _ in 0..c.rows().len() * 2 {
+            c.move_cursor(1);
+        }
+        assert_eq!(c.cursor(), last_own + TRAILING);
+        assert_eq!(c.trailing_cursor(), Some(TRAILING - 1));
+        // A trailing row is not the editor's, so it has none to hand back.
+        assert!(c.selected().is_none());
+    }
+
+    #[test]
+    fn stepping_back_off_a_trailing_row_lands_on_the_editors_last() {
+        let mut c = controls();
+        for _ in 0..c.rows().len() * 2 {
+            c.move_cursor(1);
+        }
+        for _ in 0..TRAILING {
+            c.move_cursor(-1);
+        }
+        assert_eq!(c.trailing_cursor(), None);
+        assert!(c.selected().is_some_and(|r| r.selectable()));
+    }
+
+    #[test]
+    fn a_click_can_land_on_a_trailing_row() {
+        let mut c = controls();
+        let first_trailing = c.rows().len();
+        c.set_cursor(first_trailing);
+        assert_eq!(c.trailing_cursor(), Some(0));
+        c.set_cursor(first_trailing + TRAILING);
+        assert_eq!(c.trailing_cursor(), Some(0));
+    }
+
+    /// The rows shift under a trailing cursor when a command opens; it must not
+    /// be left pointing past the end.
+    #[test]
+    fn a_trailing_cursor_survives_a_rebuild() {
+        let mut c = controls();
+        let store = Store::default();
+        c.set_cursor(c.rows().len() + TRAILING - 1);
+        c.toggle_command(TestAction::Confirm, &store);
+        assert_eq!(c.trailing_cursor(), Some(TRAILING - 1));
+        c.toggle_command(TestAction::Confirm, &store);
+        assert_eq!(c.trailing_cursor(), Some(TRAILING - 1));
+    }
+
+    #[test]
+    fn no_trailing_rows_leaves_the_cursor_inside_the_editor() {
+        let mut c = Controls::new(GROUPS, &[], 0);
+        c.show(&Store::default());
+        for _ in 0..c.rows().len() * 2 {
+            c.move_cursor(1);
+        }
+        assert_eq!(c.trailing_cursor(), None);
+        assert!(c.selected().is_some());
+    }
+}
+
+#[cfg(test)]
+mod mods_tests {
+    use crate::Mods;
+
+    #[test]
+    fn only_ctrl_and_alt_stop_a_gesture_being_plain() {
+        assert!(Mods::NONE.is_plain());
+        // Shift is part of ordinary typing, so it stays plain.
+        assert!(Mods::SHIFT.is_plain());
+        assert!(!Mods::CTRL.is_plain());
+        assert!(!Mods::ALT.is_plain());
+        assert!(!Mods::CTRL.union(Mods::SHIFT).is_plain());
     }
 }

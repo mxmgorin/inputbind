@@ -92,12 +92,30 @@ impl Pad {
     /// A direction, if this is one — the four that a stick can also stand in
     /// for.
     pub fn direction(self) -> bool {
-        matches!(self, Pad::Up | Pad::Down | Pad::Left | Pad::Right)
+        self.vector().is_some()
+    }
+
+    /// The unit step this direction stands for; `y` is positive downward.
+    pub fn vector(self) -> Option<(i32, i32)> {
+        Some(match self {
+            Pad::Up => (0, -1),
+            Pad::Down => (0, 1),
+            Pad::Left => (-1, 0),
+            Pad::Right => (1, 0),
+            _ => return None,
+        })
     }
 
     pub(super) fn bit(self) -> u16 {
         1 << self as u16
     }
+}
+
+/// Which end of a held action this is. One-shot actions only report `Press`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Edge {
+    Press,
+    Release,
 }
 
 /// One pad currently down, with the actions its press already resolved.
@@ -109,6 +127,8 @@ struct Held<A> {
     resolved: bool,
     tap: Option<A>,
     hold: Option<A>,
+    /// A held action whose press edge fired here; this release owes its close.
+    owed: Option<A>,
 }
 
 /// Gesture resolution and auto-repeat over the pads currently down.
@@ -128,9 +148,20 @@ impl<A: Action> PadState<A> {
         }
     }
 
-    /// Forget every pad down and any repeat — for a bindings reload, whose new
-    /// tables would otherwise resolve a press that started under the old ones.
-    pub fn reset(&mut self) {
+    /// Retune in place, so an edit cannot swallow a gesture or an owed release.
+    pub fn set_timing(&mut self, hold: Duration, cadence: Cadence) {
+        self.hold = hold;
+        self.repeat.set_cadence(cadence);
+    }
+
+    /// Forget every pad down and any repeat, for a bindings reload. Owed releases
+    /// are emitted first, or the host keeps a click nothing closes.
+    pub fn reset(&mut self, out: &mut Vec<(A, Edge)>) {
+        for held in &self.held {
+            if let Some(action) = held.owed {
+                out.push((action, Edge::Release));
+            }
+        }
         self.held.clear();
         self.repeat.clear();
     }
@@ -141,7 +172,7 @@ impl<A: Action> PadState<A> {
         now: Instant,
         bindings: &Bindings<A>,
         surface: Option<SurfaceId>,
-        out: &mut Vec<A>,
+        out: &mut Vec<(A, Edge)>,
     ) {
         // A chord resolves the moment its second pad goes down, consuming both
         // presses so neither fires its own tap on release.
@@ -160,14 +191,21 @@ impl<A: Action> PadState<A> {
                 resolved: true,
                 tap: None,
                 hold: None,
+                // Fired on this pad's press edge, so its release closes it.
+                owed: action.is_held().then_some(action),
             });
-            out.push(action);
+            out.push((action, Edge::Press));
             return;
         }
 
         // A press for a pad already down (a release we never saw) replaces it
-        // rather than stacking, so `held_pads` cannot grow phantoms.
-        self.held.retain(|h| h.pad != pad);
+        // rather than stacking, closing whatever it owed.
+        if let Some(i) = self.held.iter().position(|h| h.pad == pad) {
+            if let Some(action) = self.held[i].owed {
+                out.push((action, Edge::Release));
+            }
+            self.held.remove(i);
+        }
         let tap = bindings.tap(pad, surface);
         let hold = bindings.hold(pad);
         let immediate = !bindings.is_deferred(pad);
@@ -177,25 +215,32 @@ impl<A: Action> PadState<A> {
             resolved: immediate,
             tap,
             hold,
+            owed: None,
         });
         if !immediate {
             return;
         }
         if let Some(action) = tap {
-            out.push(action);
+            out.push((action, Edge::Press));
+            if action.is_held() {
+                self.held.last_mut().expect("just pushed").owed = Some(action);
+            }
             if action.repeats() {
                 self.repeat.start(pad, action, now);
             }
         }
     }
 
-    pub fn on_release(&mut self, pad: Pad, now: Instant, out: &mut Vec<A>) {
+    pub fn on_release(&mut self, pad: Pad, now: Instant, out: &mut Vec<(A, Edge)>) {
         self.repeat.stop(pad);
         let Some(i) = self.held.iter().position(|h| h.pad == pad) else {
             return; // held before this state existed, or already consumed
         };
         let held = self.held.remove(i);
         if held.resolved {
+            if let Some(action) = held.owed {
+                out.push((action, Edge::Release));
+            }
             return;
         }
         // Released before the threshold it is a tap; past it the hold fires
@@ -206,19 +251,25 @@ impl<A: Action> PadState<A> {
             held.tap
         };
         if let Some(action) = action {
-            out.push(action);
+            out.push((action, Edge::Press));
+            // The release itself resolved this, so there is no edge left to wait for.
+            if action.is_held() {
+                out.push((action, Edge::Release));
+            }
         }
     }
 
     /// Fire any hold whose threshold just passed and any due repeat. Called
     /// once per loop pass; [`Self::next_deadline`] says when that must be.
-    pub fn tick(&mut self, now: Instant, out: &mut Vec<A>) {
+    pub fn tick(&mut self, now: Instant, out: &mut Vec<(A, Edge)>) {
         for held in &mut self.held {
             if held.resolved || now.duration_since(held.at) < self.hold {
                 continue;
             }
             if let Some(action) = held.hold {
-                out.push(action);
+                out.push((action, Edge::Press));
+                // The pad is still down, so its release closes this.
+                held.owed = action.is_held().then_some(action);
                 held.resolved = true;
             }
         }
@@ -270,6 +321,16 @@ impl Stick {
             engaged: None,
             deadzone,
         }
+    }
+
+    pub fn set_deadzone(&mut self, deadzone: f32) {
+        self.deadzone = deadzone;
+    }
+
+    /// Dead-zoned, for a host driving a cursor; centered reads exactly `(0.0, 0.0)`.
+    pub fn vector(&self) -> (f32, f32) {
+        let live = |v: f32| if v.abs() < self.deadzone { 0.0 } else { v };
+        (live(self.x), live(self.y))
     }
 
     /// Feed one axis (`-1.0..=1.0`, y positive downward as SDL reports it).
@@ -327,6 +388,10 @@ impl Trigger {
         }
     }
 
+    pub fn set_threshold(&mut self, threshold: f32) {
+        self.threshold = threshold;
+    }
+
     /// Feed the trigger's axis (`0.0..=1.0`). Returns the edge as
     /// (released, pressed), shaped like [`Stick::axis`] so the caller treats
     /// both the same.
@@ -352,7 +417,7 @@ impl Trigger {
 
 #[cfg(test)]
 mod tests {
-    use super::super::testkit::{at, build, TestAction};
+    use super::super::testkit::{actions, at, build, TestAction};
     use super::*;
 
     const HOLD: Duration = Duration::from_millis(400);
@@ -380,7 +445,7 @@ mod tests {
         s.tick(at(t0, 399), &mut out);
         assert!(out.is_empty());
         s.tick(at(t0, 400), &mut out);
-        assert_eq!(out, [TestAction::ThemeNext]);
+        assert_eq!(actions(&out), [TestAction::ThemeNext]);
         out.clear();
         s.on_release(Pad::Y, at(t0, 500), &mut out);
         assert!(out.is_empty());
@@ -394,13 +459,13 @@ mod tests {
         let t0 = Instant::now();
         s.on_press(Pad::Y, t0, &b, None, &mut out);
         s.on_release(Pad::Y, at(t0, 100), &mut out);
-        assert_eq!(out, [TestAction::Confirm]);
+        assert_eq!(actions(&out), [TestAction::Confirm]);
 
         // Past the threshold with no tick in between, release fires the hold.
         out.clear();
         s.on_press(Pad::Y, at(t0, 1000), &b, None, &mut out);
         s.on_release(Pad::Y, at(t0, 1400), &mut out);
-        assert_eq!(out, [TestAction::ThemeNext]);
+        assert_eq!(actions(&out), [TestAction::ThemeNext]);
     }
 
     #[test]
@@ -410,17 +475,17 @@ mod tests {
         let mut out = Vec::new();
         let t0 = Instant::now();
         s.on_press(Pad::Down, t0, &b, None, &mut out);
-        assert_eq!(out, [TestAction::NavDown]);
+        assert_eq!(actions(&out), [TestAction::NavDown]);
         out.clear();
         s.tick(at(t0, 299), &mut out);
         assert!(out.is_empty());
         s.tick(at(t0, 300), &mut out);
-        assert_eq!(out, [TestAction::NavDown]);
+        assert_eq!(actions(&out), [TestAction::NavDown]);
         out.clear();
         s.tick(at(t0, 350), &mut out);
         assert!(out.is_empty());
         s.tick(at(t0, 400), &mut out);
-        assert_eq!(out, [TestAction::NavDown]);
+        assert_eq!(actions(&out), [TestAction::NavDown]);
         out.clear();
         s.on_release(Pad::Down, at(t0, 450), &mut out);
         s.tick(at(t0, 600), &mut out);
@@ -436,7 +501,7 @@ mod tests {
         s.on_press(Pad::Start, t0, &b, None, &mut out);
         assert!(out.is_empty());
         s.on_press(Pad::Select, at(t0, 50), &b, None, &mut out);
-        assert_eq!(out, [TestAction::ThemeNext]);
+        assert_eq!(actions(&out), [TestAction::ThemeNext]);
         // Neither release fires the tap the chord consumed.
         out.clear();
         s.on_release(Pad::Select, at(t0, 200), &mut out);
@@ -503,5 +568,133 @@ mod tests {
         // Inside the band it neither re-fires nor releases.
         assert_eq!(trigger.axis(0.4), (None, None));
         assert_eq!(trigger.axis(0.2), (Some(Pad::L2), None));
+    }
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::super::testkit::{at, build, TestAction};
+    use super::*;
+
+    const HOLD: Duration = Duration::from_millis(400);
+
+    fn state() -> PadState<TestAction> {
+        PadState::new(
+            HOLD,
+            Cadence {
+                initial_delay: Duration::from_millis(300),
+                interval: Duration::from_millis(100),
+            },
+        )
+    }
+
+    #[test]
+    fn a_held_action_closes_on_its_own_pads_release() {
+        let b = build("[gamepad]\na = \"click\"\n");
+        let mut s = state();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        s.on_press(Pad::A, t0, &b, None, &mut out);
+        assert_eq!(out, [(TestAction::Click, Edge::Press)]);
+        out.clear();
+        s.on_release(Pad::A, at(t0, 80), &mut out);
+        assert_eq!(out, [(TestAction::Click, Edge::Release)]);
+    }
+
+    #[test]
+    fn a_one_shot_reports_only_its_press() {
+        let b = build("[gamepad]\nx = \"theme_next\"\n");
+        let mut s = state();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        s.on_press(Pad::X, t0, &b, None, &mut out);
+        s.on_release(Pad::X, at(t0, 80), &mut out);
+        assert_eq!(out, [(TestAction::ThemeNext, Edge::Press)]);
+    }
+
+    #[test]
+    fn a_deferred_held_tap_opens_and_closes_at_once() {
+        let b = build("[gamepad]\nb = \"click\"\n\"hold:b\" = \"theme_next\"\n");
+        let mut s = state();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        s.on_press(Pad::B, t0, &b, None, &mut out);
+        assert!(out.is_empty(), "a deferred tap waits");
+        s.on_release(Pad::B, at(t0, 100), &mut out);
+        assert_eq!(
+            out,
+            [
+                (TestAction::Click, Edge::Press),
+                (TestAction::Click, Edge::Release)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_held_action_fired_by_a_hold_waits_for_the_release() {
+        let b = build("[gamepad]\n\"hold:y\" = \"click\"\n");
+        let mut s = state();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        s.on_press(Pad::Y, t0, &b, None, &mut out);
+        s.tick(at(t0, 400), &mut out);
+        assert_eq!(out, [(TestAction::Click, Edge::Press)]);
+        out.clear();
+        s.on_release(Pad::Y, at(t0, 900), &mut out);
+        assert_eq!(out, [(TestAction::Click, Edge::Release)]);
+    }
+
+    #[test]
+    fn reset_closes_what_it_still_owes() {
+        let b = build("[gamepad]\na = \"click\"\n");
+        let mut s = state();
+        let mut out = Vec::new();
+        s.on_press(Pad::A, Instant::now(), &b, None, &mut out);
+        out.clear();
+        s.reset(&mut out);
+        assert_eq!(out, [(TestAction::Click, Edge::Release)]);
+        out.clear();
+        s.on_release(Pad::A, Instant::now(), &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_repeated_press_closes_the_click_it_replaces() {
+        let b = build("[gamepad]\na = \"click\"\n");
+        let mut s = state();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        s.on_press(Pad::A, t0, &b, None, &mut out);
+        out.clear();
+        s.on_press(Pad::A, at(t0, 50), &b, None, &mut out);
+        assert_eq!(
+            out,
+            [
+                (TestAction::Click, Edge::Release),
+                (TestAction::Click, Edge::Press)
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_four_directions_have_a_vector() {
+        assert_eq!(Pad::Up.vector(), Some((0, -1)));
+        assert_eq!(Pad::Down.vector(), Some((0, 1)));
+        assert_eq!(Pad::Left.vector(), Some((-1, 0)));
+        assert_eq!(Pad::Right.vector(), Some((1, 0)));
+        assert_eq!(Pad::A.vector(), None);
+        for pad in Pad::ALL {
+            assert_eq!(pad.direction(), pad.vector().is_some());
+        }
+    }
+
+    #[test]
+    fn a_sticks_vector_is_zero_inside_the_deadzone() {
+        let mut stick = Stick::new(0.5);
+        stick.axis(true, 0.3);
+        stick.axis(false, -0.8);
+        assert_eq!(stick.vector(), (0.0, -0.8));
+        stick.axis(false, 0.1);
+        assert_eq!(stick.vector(), (0.0, 0.0));
     }
 }
