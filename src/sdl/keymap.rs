@@ -58,6 +58,10 @@ const MIYOO: &[(Keycode, Pad)] = &[
     (Keycode::RCTRL, Pad::Select),
     (Keycode::E, Pad::L1),
     (Keycode::T, Pad::R1),
+    // Untranslated, these two read as a keyboard's own Tab and Backspace, and a
+    // host that binds those has the wrong trigger opening a menu.
+    (Keycode::TAB, Pad::L2),
+    (Keycode::BACKSPACE, Pad::R2),
     // The device sends its own shoulders, but a USB keyboard in the dock sends
     // these.
     (Keycode::PAGEUP, Pad::L1),
@@ -100,9 +104,37 @@ mod tests {
             (Keycode::RCTRL, Pad::Select),
             (Keycode::E, Pad::L1),
             (Keycode::T, Pad::R1),
+            (Keycode::TAB, Pad::L2),
+            (Keycode::BACKSPACE, Pad::R2),
             (Keycode::DOWN, Pad::Down),
         ] {
             assert_eq!(Keymap::MiyooMini.pad(key), Some(pad));
+        }
+    }
+
+    #[test]
+    fn every_pad_the_device_has_is_translated() {
+        // A key left out of the table reaches the host as itself, where a
+        // `[keyboard]` row can answer for a trigger — which is what L2 and R2
+        // did until they were added.
+        let mapped: Vec<Pad> = MIYOO.iter().map(|(_, pad)| *pad).collect();
+        for pad in [
+            Pad::A,
+            Pad::B,
+            Pad::X,
+            Pad::Y,
+            Pad::L1,
+            Pad::R1,
+            Pad::L2,
+            Pad::R2,
+            Pad::Start,
+            Pad::Select,
+            Pad::Up,
+            Pad::Down,
+            Pad::Left,
+            Pad::Right,
+        ] {
+            assert!(mapped.contains(&pad), "{} has no key", pad.name());
         }
     }
 

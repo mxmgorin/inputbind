@@ -46,7 +46,7 @@ impl KeyNames {
             let Some(keycode) = Keycode::from_i32(code) else {
                 return;
             };
-            let name = keycode.name();
+            let name = name_of(keycode);
             // Several codes can carry one name — SDL names 65 "A" though it
             // only ever delivers 97, and `Return` is both SDLK_RETURN and the
             // legacy SDLK_RETURN2. Keep the code SDL resolves the name back to
@@ -74,6 +74,20 @@ impl KeyNames {
             .ok()
             .map(|i| self.entries[i].1)
     }
+}
+
+/// SDL's own name for a key. Classic SDL2 spells character keys into one
+/// static buffer, so concurrent naming tears; only the parallel test suite
+/// names keys concurrently, so only test builds take a lock.
+fn name_of(keycode: Keycode) -> String {
+    #[cfg(test)]
+    let _naming = {
+        use std::sync::{Mutex, PoisonError};
+        // Guards a call, not data, so poisoning protects nothing.
+        static NAMING: Mutex<()> = Mutex::new(());
+        NAMING.lock().unwrap_or_else(PoisonError::into_inner)
+    };
+    keycode.name()
 }
 
 /// Short spellings for keys whose SDL names are a mouthful. An alias resolves
@@ -186,7 +200,7 @@ pub fn key_code(keycode: Keycode) -> u32 {
 
 /// The normalized name capture writes into a gesture.
 pub fn key_name(keycode: Keycode) -> String {
-    normalize(&keycode.name())
+    normalize(&name_of(keycode))
 }
 
 #[cfg(test)]
@@ -238,6 +252,32 @@ mod tests {
                 Some(key_code(keycode)),
                 "round trip for `{name}`"
             );
+        }
+    }
+
+    #[test]
+    fn a_table_built_beside_another_keeps_its_keys() {
+        // Without the test-only lock in `name_of`, parallel table builds
+        // tear names in classic SDL2's shared buffer.
+        let builders: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..25 {
+                        let names = KeyNames::new();
+                        for keycode in [Keycode::A, Keycode::Z, Keycode::NUM_0] {
+                            let name = key_name(keycode);
+                            assert_eq!(
+                                names.code(&name),
+                                Some(key_code(keycode)),
+                                "`{name}` went missing"
+                            );
+                        }
+                    }
+                })
+            })
+            .collect();
+        for builder in builders {
+            builder.join().expect("a builder only panics on a lost key");
         }
     }
 }
