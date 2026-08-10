@@ -164,8 +164,9 @@ impl<A: Action> Controls<A> {
         self.rows.get(self.cursor)
     }
 
-    /// Step the cursor over selectable rows only; the ends clamp, since the list
-    /// is long enough that wrapping would just lose you.
+    /// Step the cursor over selectable rows only, wrapping at the ends: the
+    /// host's own rows sit last, and paging the whole list is a poor way to
+    /// reach them.
     pub fn move_cursor(&mut self, delta: i32) {
         if self.selectable.is_empty() {
             return;
@@ -175,8 +176,8 @@ impl<A: Action> Controls<A> {
             .iter()
             .position(|i| *i == self.cursor)
             .unwrap_or(0) as i32;
-        let next = (at + delta).clamp(0, self.selectable.len() as i32 - 1);
-        self.cursor = self.selectable[next as usize];
+        let len = self.selectable.len() as i32;
+        self.cursor = self.selectable[(at + delta).rem_euclid(len) as usize];
     }
 
     /// A tap lands on a row directly; a header tap is ignored.
@@ -591,17 +592,23 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_skips_groups_and_clamps() {
+    fn the_cursor_skips_groups_and_wraps() {
         let mut c = controls();
         c.show(&store());
         assert!(c.selected().is_some_and(|r| r.selectable()));
-        c.move_cursor(-5);
-        assert_eq!(c.cursor(), c.selectable[0]);
-        for _ in 0..c.rows().len() * 2 {
-            c.move_cursor(1);
-        }
+        // Back off the top lands on the last row, and forward returns.
+        c.move_cursor(-1);
         assert_eq!(c.cursor(), *c.selectable.last().expect("rows exist"));
         assert!(c.selected().is_some_and(|r| r.selectable()));
+        c.move_cursor(1);
+        assert_eq!(c.cursor(), c.selectable[0]);
+        // A page jump wraps by the same arithmetic, landing on a row either way.
+        c.move_cursor(-5);
+        assert_eq!(c.cursor(), c.selectable[c.selectable.len() - 5]);
+        for _ in 0..c.rows().len() * 2 {
+            c.move_cursor(1);
+            assert!(c.selected().is_some_and(|r| r.selectable()));
+        }
     }
 
     #[test]
@@ -829,9 +836,8 @@ mod trailing_tests {
     fn the_cursor_reaches_the_hosts_rows_past_the_editors_own() {
         let mut c = controls();
         let last_own = c.rows().len() - 1;
-        for _ in 0..c.rows().len() * 2 {
-            c.move_cursor(1);
-        }
+        // The wrap is what makes them cheap to reach: one step back off the top.
+        c.move_cursor(-1);
         assert_eq!(c.cursor(), last_own + TRAILING);
         assert_eq!(c.trailing_cursor(), Some(TRAILING - 1));
         // A trailing row is not the editor's, so it has none to hand back.
@@ -841,9 +847,7 @@ mod trailing_tests {
     #[test]
     fn stepping_back_off_a_trailing_row_lands_on_the_editors_last() {
         let mut c = controls();
-        for _ in 0..c.rows().len() * 2 {
-            c.move_cursor(1);
-        }
+        c.move_cursor(-1);
         for _ in 0..TRAILING {
             c.move_cursor(-1);
         }
