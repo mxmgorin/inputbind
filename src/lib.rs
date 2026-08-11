@@ -1,6 +1,7 @@
 //! Rebindable input: gestures on a pad or a keyboard resolve to the host app's
-//! own action type. Only [`sdl`] names a backend, and it sits behind the
-//! `sdl2` feature.
+//! own action type. Two modules name backends: [`sdl`], behind the `sdl2`
+//! feature, and [`evdev`], the keypad read from the Linux kernel for devices
+//! whose own input layer is lossy.
 //!
 //! The app supplies three things: an [`Action`] vocabulary, the default
 //! [`Store`], and a key-name resolver (the backend knows which names exist).
@@ -13,6 +14,7 @@
 
 mod capture;
 pub mod editor;
+pub mod evdev;
 mod gesture;
 mod keys;
 mod pad;
