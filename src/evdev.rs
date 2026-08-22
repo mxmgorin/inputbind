@@ -4,6 +4,9 @@
 //! pumps cancel out; the kernel's queue loses nothing and fans out to every
 //! reader. The host opens the node, parks a thread in [`read_edges`], and
 //! forwards each edge into its own event loop.
+//!
+//! [`read_keys`] is the same stream with the system keys left in, for a host
+//! that answers one of them itself.
 
 use super::pad::{Edge, Pad};
 use std::io::Read;
@@ -46,6 +49,29 @@ const KEY_LEFT: u16 = 105;
 const KEY_RIGHT: u16 = 106;
 const KEY_DOWN: u16 = 108;
 
+/// A key the device keeps for its launcher: on the Miyoo, MENU. OnionOS gives
+/// it to a kill helper; a launcher with none leaves it to the app.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum SystemKey {
+    Menu,
+}
+
+/// What a kernel key code turned out to be.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Key {
+    Pad(Pad),
+    System(SystemKey),
+}
+
+impl Key {
+    pub fn pad(self) -> Option<Pad> {
+        match self {
+            Key::Pad(pad) => Some(pad),
+            Key::System(_) => None,
+        }
+    }
+}
+
 /// Which device's keypad the kernel codes describe — the same role
 /// `sdl::Keymap` plays for the keys SDL makes of them.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -55,18 +81,24 @@ pub enum Keymap {
 
 impl Keymap {
     /// The pad a kernel key code stands for, `None` for a key that is not the
-    /// pad's (MENU stays a system key on the Miyoo).
+    /// pad's — the system keys among them.
     pub fn pad(self, code: u16) -> Option<Pad> {
+        self.key(code).and_then(Key::pad)
+    }
+
+    /// As [`Keymap::pad`], with the system keys named rather than dropped.
+    pub fn key(self, code: u16) -> Option<Key> {
         match self {
-            Keymap::MiyooMini => miyoo(code),
+            Keymap::MiyooMini => match code {
+                KEY_ESC => Some(Key::System(SystemKey::Menu)),
+                _ => miyoo(code).map(Key::Pad),
+            },
         }
     }
 }
 
 fn miyoo(code: u16) -> Option<Pad> {
     Some(match code {
-        // MENU is the system kill helper's, not a pad.
-        KEY_ESC => return None,
         KEY_UP => Pad::Up,
         KEY_DOWN => Pad::Down,
         KEY_LEFT => Pad::Left,
@@ -89,9 +121,23 @@ fn miyoo(code: u16) -> Option<Pad> {
 /// so the host gives it a thread; a kernel node never ends on its own, and
 /// `Ok` is the stream closing under us.
 pub fn read_edges(
-    mut source: impl Read,
+    source: impl Read,
     keymap: Keymap,
     mut on_edge: impl FnMut(Pad, Edge),
+) -> std::io::Result<()> {
+    read_keys(source, keymap, |key, edge| {
+        if let Key::Pad(pad) = key {
+            on_edge(pad, edge);
+        }
+    })
+}
+
+/// As [`read_edges`], with the system keys left in. One closure, not two:
+/// answering MENU means knowing what else was pressed while it was down.
+pub fn read_keys(
+    mut source: impl Read,
+    keymap: Keymap,
+    mut on_key: impl FnMut(Key, Edge),
 ) -> std::io::Result<()> {
     let mut raw = [0u8; EVENT_SIZE];
     loop {
@@ -108,9 +154,9 @@ pub fn read_edges(
         if ev.kind != EV_KEY || !matches!(ev.value, RELEASED | PRESSED) {
             continue;
         }
-        if let Some(pad) = keymap.pad(ev.code) {
-            on_edge(
-                pad,
+        if let Some(key) = keymap.key(ev.code) {
+            on_key(
+                key,
                 if ev.value == PRESSED {
                     Edge::Press
                 } else {
@@ -155,6 +201,26 @@ mod tests {
             edges_of(&stream),
             [(Pad::Down, Edge::Press), (Pad::Down, Edge::Release)]
         );
+    }
+
+    #[test]
+    fn menu_is_a_system_key_where_the_pad_stream_drops_it() {
+        let mut stream = Vec::new();
+        stream.extend(ev(EV_KEY, KEY_ESC, PRESSED));
+        stream.extend(ev(EV_KEY, KEY_ESC, RELEASED));
+        let mut out = Vec::new();
+        read_keys(&stream[..], Keymap::MiyooMini, |key, edge| {
+            out.push((key, edge))
+        })
+        .expect("a slice ends in EOF, never an error");
+        assert_eq!(
+            out,
+            [
+                (Key::System(SystemKey::Menu), Edge::Press),
+                (Key::System(SystemKey::Menu), Edge::Release),
+            ]
+        );
+        assert!(edges_of(&stream).is_empty());
     }
 
     /// Hands out one byte per read, as a pipe under pressure might.
